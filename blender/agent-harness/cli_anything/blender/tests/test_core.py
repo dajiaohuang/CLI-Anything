@@ -882,13 +882,18 @@ class TestRender:
 
     def test_render_scene_generates_script(self):
         proj = self._make_scene()
-        add_object(proj, name="Cube")
+        add_object(proj, name="Cube_场景")
         with tempfile.TemporaryDirectory() as tmp:
             output_path = os.path.join(tmp, "render.png")
             result = render_scene(proj, output_path, overwrite=True)
             assert os.path.exists(result["script_path"])
             assert "blender" in result["command"]
             assert result["engine"] == "CYCLES"
+
+            with open(result["script_path"], encoding="utf-8") as generated:
+                script = generated.read()
+            assert "Cube_场景" in script
+            compile(script, result["script_path"], "exec")
 
     def test_render_scene_overwrite_protection(self):
         proj = self._make_scene()
@@ -1152,13 +1157,16 @@ class TestPreview:
 
         current = preview_mod._update_current_symlink(session_dir, str(bundle_a))
         assert current.is_dir()
-        assert (current / preview_mod.CURRENT_COPY_MARKER).read_text(encoding="utf-8") == session_dir.name
         assert json.loads((current / "manifest.json").read_text(encoding="utf-8")) == {"bundle_id": "bundle-a"}
         assert (current / "only-a.txt").is_file()
 
-        preview_mod._update_current_symlink(session_dir, str(bundle_b))
-        assert json.loads((current / "manifest.json").read_text(encoding="utf-8")) == {"bundle_id": "bundle-b"}
-        assert not (current / "only-a.txt").exists()
+        with (current / "only-a.txt").open("rb") as served:
+            updated = preview_mod._update_current_symlink(session_dir, str(bundle_b))
+            assert served.read() == b"stale after update"
+        assert updated != current
+        assert json.loads((updated / "manifest.json").read_text(encoding="utf-8")) == {"bundle_id": "bundle-b"}
+        assert not (updated / "only-a.txt").exists()
+        assert (current / "only-a.txt").is_file()
 
     def test_current_directory_without_copy_marker_is_preserved(self, tmp_path):
         session_dir = tmp_path / "live-session"
@@ -1217,11 +1225,35 @@ class TestPreview:
         assert live["source_state"]["last_rendered_fingerprint"].startswith("sha256:")
         assert Path(live["_session_path"]).is_file()
         assert Path(live["_trajectory_path"]).is_file()
-        assert (Path(live["_session_dir"]) / "current" / "manifest.json").is_file()
+        assert (Path(live["_session_dir"]) / live["current_link"] / "manifest.json").is_file()
         trajectory = json.loads(Path(live["_trajectory_path"]).read_text(encoding="utf-8"))
         assert trajectory["step_count"] == 1
         assert trajectory["steps"][0]["bundle_id"] == "bundle-a"
         assert live["trajectory_step_count"] == 1
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows copy fallback")
+    def test_live_push_keeps_served_copy_readable(self, tmp_path, monkeypatch):
+        sess = Session()
+        sess.set_project(create_scene(name="CopyLifetime"), None)
+        bundles = [self._fake_bundle(tmp_path / "bundles", name) for name in ("a", "b")]
+        monkeypatch.setattr(preview_mod, "capture", lambda *args, **kwargs: bundles.pop(0))
+
+        def deny_symlink(*args, **kwargs):
+            error = OSError("symlink privilege missing")
+            error.winerror = 1314
+            raise error
+
+        monkeypatch.setattr(preview_mod.os, "symlink", deny_symlink)
+        first = preview_mod.live_start(sess, root_dir=str(tmp_path), live_mode="manual")
+        session_dir = Path(first["_session_dir"])
+        old_bundle = session_dir / first["current_link"]
+        with (old_bundle / "artifacts/hero.png").open("rb") as served:
+            pushed = preview_mod.live_push(sess, root_dir=str(tmp_path))
+            assert served.read() == b"\x89PNG\r\n\x1a\npreview"
+        current = session_dir / pushed["current_link"]
+        assert current != old_bundle
+        assert json.loads((current / "manifest.json").read_text(encoding="utf-8"))["bundle_id"] == "b"
+        assert (old_bundle / "artifacts/hero.png").is_file()
 
     def test_live_push_updates_history(self, tmp_path, monkeypatch):
         sess = Session()

@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import signal
 import time
 from datetime import datetime, timezone
@@ -219,7 +220,7 @@ def _update_current_symlink(session_dir: Path, bundle_dir: str) -> Path:
         marker = current_link / CURRENT_COPY_MARKER
         if not marker.is_file() or marker.read_text(encoding="utf-8") != session_dir.name:
             raise RuntimeError(f"Live preview current path is unexpectedly a directory: {current_link}")
-        shutil.rmtree(current_link)
+        return _copy_current_bundle(session_dir, bundle_dir)
     elif current_link.is_symlink() or current_link.exists():
         current_link.unlink()
 
@@ -230,9 +231,15 @@ def _update_current_symlink(session_dir: Path, bundle_dir: str) -> Path:
     except OSError as exc:
         if getattr(exc, "winerror", None) != 1314:
             raise
-        shutil.copytree(target_path, current_link)
-        (current_link / CURRENT_COPY_MARKER).write_text(session_dir.name, encoding="utf-8")
+        return _copy_current_bundle(session_dir, bundle_dir)
     return current_link
+
+
+def _copy_current_bundle(session_dir: Path, bundle_dir: str) -> Path:
+    # Each published copy remains immutable while the viewer may still read it.
+    staged = Path(tempfile.mkdtemp(prefix="current-", dir=session_dir))
+    shutil.copytree(Path(bundle_dir).resolve(), staged, dirs_exist_ok=True)
+    return staged
 
 
 def _history_item(bundle_manifest: Dict[str, Any]) -> Dict[str, Any]:
@@ -482,7 +489,7 @@ def _publish_live_session(
 ) -> Dict[str, Any]:
     session_dir = _live_session_dir(session, recipe, root_dir=root_dir)
     session_dir.mkdir(parents=True, exist_ok=True)
-    _update_current_symlink(session_dir, bundle_manifest["_bundle_dir"])
+    current_bundle = _update_current_symlink(session_dir, bundle_manifest["_bundle_dir"])
 
     existing = _load_existing_live_session(session_dir)
     now = _now_iso()
@@ -545,7 +552,7 @@ def _publish_live_session(
         "refresh_hint_ms": current_refresh_hint_ms,
         "source_poll_ms": current_source_poll_ms,
         "preview_root_dir": root_dir,
-        "current_link": "current",
+        "current_link": os.path.relpath(current_bundle, session_dir),
         "current_bundle_id": bundle_manifest.get("bundle_id"),
         "current_bundle_dir": bundle_manifest.get("_bundle_dir"),
         "current_manifest_path": bundle_manifest.get("_manifest_path"),
