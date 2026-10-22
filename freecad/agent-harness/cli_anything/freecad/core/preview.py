@@ -248,6 +248,33 @@ def _copy_current_bundle(session_dir: Path, bundle_dir: str) -> Path:
     return staged
 
 
+def _prune_obsolete_current_copies(
+    session_dir: Path,
+    current_bundle: Path,
+    previous_current_link: Optional[str],
+) -> None:
+    # Keep the current and immediately previous copies for active viewer reads.
+    keep = {current_bundle.name}
+    previous = Path(previous_current_link) if previous_current_link else None
+    if previous is not None and previous.parent == Path(".") and previous.name.startswith("current-"):
+        keep.add(previous.name)
+
+    for candidate in session_dir.glob("current-*"):
+        if (
+            candidate.name in keep
+            or candidate.is_symlink()
+            or not candidate.is_dir()
+            or not (candidate / "manifest.json").is_file()
+            or not (candidate / "summary.json").is_file()
+        ):
+            continue
+        try:
+            shutil.rmtree(candidate)
+        except PermissionError:
+            # A viewer may still have a file open; retry this copy on a later publish.
+            continue
+
+
 def _history_item(bundle_manifest: Dict[str, Any]) -> Dict[str, Any]:
     return build_live_history_item(bundle_manifest)
 
@@ -596,6 +623,7 @@ def _publish_live_session(
         ),
     }
     _write_json(session_dir / "session.json", payload)
+    _prune_obsolete_current_copies(session_dir, current_bundle, existing.get("current_link"))
     return _with_live_refs(session_dir, payload)
 
 

@@ -1150,7 +1150,7 @@ class TestPreview:
     def test_live_push_keeps_served_copy_readable(self, tmp_path, monkeypatch):
         sess = Session()
         sess.set_project(create_document(name="CopyLifetime"), None)
-        bundles = [self._fake_bundle(tmp_path / "bundles", name) for name in ("a", "b")]
+        bundles = [self._fake_bundle(tmp_path / "bundles", name) for name in ("a", "b", "c", "d")]
         monkeypatch.setattr(preview_mod, "capture", lambda *args, **kwargs: bundles.pop(0))
 
         def deny_symlink(*args, **kwargs):
@@ -1162,13 +1162,34 @@ class TestPreview:
         first = preview_mod.live_start(sess, root_dir=str(tmp_path), live_mode="manual")
         session_dir = Path(first["_session_dir"])
         old_bundle = session_dir / first["current_link"]
+        original_rmtree = preview_mod.shutil.rmtree
+
+        def keep_locked_copy(path, *args, **kwargs):
+            if Path(path) == old_bundle:
+                raise PermissionError("preview artifact is still being served")
+            return original_rmtree(path, *args, **kwargs)
+
         with (old_bundle / "artifacts/hero.png").open("rb") as served:
-            pushed = preview_mod.live_push(sess, root_dir=str(tmp_path))
+            pushed_b = preview_mod.live_push(sess, root_dir=str(tmp_path))
             assert served.read() == b"\x89PNG\r\n\x1a\npreview"
-        current = session_dir / pushed["current_link"]
-        assert current != old_bundle
-        assert json.loads((current / "manifest.json").read_text(encoding="utf-8"))["bundle_id"] == "b"
-        assert (old_bundle / "artifacts/hero.png").is_file()
+            current_b = session_dir / pushed_b["current_link"]
+            assert current_b != old_bundle
+            assert json.loads((current_b / "manifest.json").read_text(encoding="utf-8"))["bundle_id"] == "b"
+
+            monkeypatch.setattr(preview_mod.shutil, "rmtree", keep_locked_copy)
+            pushed_c = preview_mod.live_push(sess, root_dir=str(tmp_path))
+            current_c = session_dir / pushed_c["current_link"]
+            assert json.loads((current_c / "manifest.json").read_text(encoding="utf-8"))["bundle_id"] == "c"
+            assert (old_bundle / "artifacts/hero.png").is_file()
+
+        monkeypatch.setattr(preview_mod.shutil, "rmtree", original_rmtree)
+        pushed_d = preview_mod.live_push(sess, root_dir=str(tmp_path))
+        current_d = session_dir / pushed_d["current_link"]
+        assert json.loads((current_d / "manifest.json").read_text(encoding="utf-8"))["bundle_id"] == "d"
+        assert not old_bundle.exists()
+        assert not current_b.exists()
+        assert current_c.exists()
+        assert current_d.exists()
 
     def test_live_push_updates_history(self, tmp_path, monkeypatch):
         sess = Session()
