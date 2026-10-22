@@ -8,6 +8,7 @@ beyond pytest.
 import json
 import math
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -1190,6 +1191,91 @@ class TestPreview:
         assert not current_b.exists()
         assert current_c.exists()
         assert current_d.exists()
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows copy fallback")
+    def test_concurrent_publishes_do_not_prune_an_uncommitted_copy(self, tmp_path, monkeypatch):
+        sess = Session()
+        sess.set_project(create_document(name="ConcurrentCopyLifetime"), None)
+        bundle_a = self._fake_bundle(tmp_path / "bundles", "bundle-a")
+        bundle_b = self._fake_bundle(tmp_path / "bundles", "bundle-b")
+
+        def deny_symlink(*args, **kwargs):
+            error = OSError("symlink privilege missing")
+            error.winerror = 1314
+            raise error
+
+        monkeypatch.setattr(preview_mod.os, "symlink", deny_symlink)
+        original_copy = preview_mod._copy_current_bundle
+        first_copy_ready = threading.Event()
+        release_first = threading.Event()
+        second_copy_started = threading.Event()
+        second_call_started = threading.Event()
+        copy_count = 0
+        copy_count_lock = threading.Lock()
+        results = {}
+        errors = []
+
+        def pause_first_copy(session_dir, bundle_dir):
+            nonlocal copy_count
+            current_bundle = original_copy(session_dir, bundle_dir)
+            with copy_count_lock:
+                copy_count += 1
+                call_number = copy_count
+            if call_number == 1:
+                first_copy_ready.set()
+                if not release_first.wait(timeout=5):
+                    raise TimeoutError("test did not release the first publisher")
+            else:
+                second_copy_started.set()
+            return current_bundle
+
+        monkeypatch.setattr(preview_mod, "_copy_current_bundle", pause_first_copy)
+
+        def publish(key, bundle):
+            try:
+                results[key] = preview_mod._publish_live_session(
+                    sess,
+                    bundle,
+                    recipe="quick",
+                    root_dir=str(tmp_path),
+                    live_mode="manual",
+                    publish_reason="concurrency-test",
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        def publish_second():
+            second_call_started.set()
+            publish("second", bundle_b)
+
+        first = threading.Thread(target=publish, args=("first", bundle_a), daemon=True)
+        second = threading.Thread(target=publish_second, daemon=True)
+        second_was_serialized = False
+        first.start()
+        try:
+            assert first_copy_ready.wait(timeout=5)
+            second.start()
+            assert second_call_started.wait(timeout=5)
+            second_was_serialized = not second_copy_started.wait(timeout=0.5)
+        finally:
+            release_first.set()
+        first.join(timeout=5)
+        if second.ident is not None:
+            second.join(timeout=5)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert second_was_serialized
+        assert not errors
+        assert set(results) == {"first", "second"}
+
+        session_dir = Path(results["second"]["_session_dir"])
+        published = json.loads((session_dir / "session.json").read_text(encoding="utf-8"))
+        current_bundle = session_dir / published["current_link"]
+        assert published["current_link"] == results["second"]["current_link"]
+        current_manifest = json.loads((current_bundle / "manifest.json").read_text(encoding="utf-8"))
+        assert current_manifest["bundle_id"] == "bundle-b"
+        assert (session_dir / results["first"]["current_link"]).is_dir()
 
     def test_live_push_updates_history(self, tmp_path, monkeypatch):
         sess = Session()
